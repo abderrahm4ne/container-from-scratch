@@ -7,6 +7,8 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 void run(char *argv[]);
 int child(void *argv);
@@ -29,6 +31,7 @@ int main(int argc, char *argv[]) {
 }
 
 void run(char *argv[]) {
+
     if(argv[0] == NULL) {
         printf("No args provided\n");
         return;
@@ -39,10 +42,14 @@ void run(char *argv[]) {
         perror("stack malloc failed");
         exit(1);
     }
+    const int flags = CLONE_NEWPID // new pid namespace with pid 1
+     | CLONE_NEWUTS // new uts namespace for hostname
+      | CLONE_NEWNS // new mount namespace without affecting host mounts
+       | CLONE_NEWUSER // new user namespace
+        | SIGCHLD; // signal sent when child terminates to parent
 
-    pid_t pid = clone(child, stack + 1024 * 1024,
-                      CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                      argv);
+    pid_t pid = clone(child, stack + 1024 * 1024, flags, argv); 
+        // we user fork to create an isolated process
 
     if (pid == -1) {
         perror("clone failed");
@@ -78,6 +85,11 @@ int child(void *arg) {
         perror("mount /proc failed");
         return 1;
     }
+    // mount proc filesystem so container can excute commands like ps
+    // proc inside container will show only processes inside the container
+
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+    // to prevent container mounts from affecting host
 
     if(execvp(argv[0], argv) == -1) {
         perror("execvp failed");
@@ -103,18 +115,30 @@ int wfile(const char *path, const char *value) {
 void cgroup(pid_t pid) {
     char path[256], buf[32];
 
-    const char *cgroup_path = "/sys/fs/cgroup/mycontainer/";
+    const char *cgroup_path = "/sys/fs/cgroup/mycontainer";
     snprintf(path, sizeof(path), "%s", cgroup_path);
-    mkdir(path, 0755);
 
+    if(mkdir(path, 0755) == -1) {
+        perror("mkdir cgroup failed");
+        exit(1);
+    } // create cgroup directory if not exists
+                       // inside /sys/fs/cgroup
+
+                       // set memory limit to 50MB
     snprintf(path, sizeof(path), "%s/memory.max", cgroup_path);
     snprintf(buf, sizeof(buf), "%d", 50*1024*1024);
     wfile(path, buf);
 
+                      // set pids limit to 20
     snprintf(path, sizeof(path), "%s/pids.max", cgroup_path );
     wfile(path, "20");
 
+                     // add the process to this cgroup
     snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_path);
     snprintf(buf, sizeof(buf), "%d", pid);
     wfile(path, buf);
+
+    setpriority(PRIO_PROCESS, pid, 10); 
+    // adjust the priority of the process with (nice value) which affects SCHED_OTHER scheduling and cput time it gets
+    // we lowered the priority to 10 wich you can tell it corresponds to the queue level 110 
 }
